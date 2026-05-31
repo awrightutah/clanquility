@@ -164,7 +164,7 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
       if (_shoppingLists.isNotEmpty) {
         _activeListId = _shoppingLists.first['id'];
       } else {
-        await _createDefaultList();
+        await _ensureDefaultList();
       }
 
       await _loadShoppingItems();
@@ -173,14 +173,48 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
     }
   }
 
+  // Dedupe concurrent _createDefaultList calls within this screen instance.
+  // _loadData fires from 5 sites (initState, realtime tick, active-member
+  // tick, refresh button, pull-to-refresh). Without this, two near-simultaneous
+  // loads could both observe 'no active list' and both call _createDefaultList,
+  // producing duplicate is_active=true rows for the same store. The partial
+  // unique index from migration 0029 is the DB-level backstop; this is the
+  // app-level defense that avoids hitting the constraint at all in normal use.
+  Future<void>? _pendingDefaultListCreation;
+
+  Future<void> _ensureDefaultList() async {
+    if (_pendingDefaultListCreation != null) {
+      await _pendingDefaultListCreation;
+      return;
+    }
+    _pendingDefaultListCreation = _createDefaultList();
+    try {
+      await _pendingDefaultListCreation;
+    } finally {
+      _pendingDefaultListCreation = null;
+    }
+  }
+
   Future<void> _createDefaultList() async {
     if (_household == null) return;
+
+    // Default store is required — shopping_lists.store_id is NOT NULL after
+    // migration 0028. Backfill (0025) seeded a 'Grocery Store' with
+    // is_default=true for every household, so _stores should always have one.
+    // Defensive fallback to first store if none marked default.
+    final defaultStore = _stores.firstWhere(
+      (s) => s['is_default'] == true,
+      orElse: () => _stores.isNotEmpty ? _stores.first : <String, dynamic>{},
+    );
+    final storeId = defaultStore['id'] as String?;
+    if (storeId == null) return;
 
     try {
       final newList = await Supabase.instance.client
           .from('shopping_lists')
           .insert({
             'household_id': _household!['id'],
+            'store_id': storeId,
             'name': 'Current Shopping List',
             'is_active': true,
             'created_by_member_id': _myMembership!['id'],
@@ -192,6 +226,28 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
         _shoppingLists = [newList];
         _activeListId = newList['id'];
       });
+    } on PostgrestException catch (e) {
+      if (e.code == '23505') {
+        // Unique violation — another path (concurrent client, or this client
+        // racing across instances) created an active list for this store
+        // first. Reload to pick it up rather than failing the user.
+        final existing = await Supabase.instance.client
+            .from('shopping_lists')
+            .select()
+            .eq('household_id', _household!['id'])
+            .eq('store_id', storeId)
+            .eq('is_active', true)
+            .maybeSingle();
+        if (existing != null) {
+          setState(() {
+            _shoppingLists = [existing];
+            _activeListId = existing['id'] as String?;
+          });
+        }
+      }
+      // Other PostgrestExceptions are swallowed silently here, matching
+      // the catch (_) pattern used elsewhere in this method. Errors won't
+      // reach the outer catch.
     } catch (_) {}
   }
 

@@ -104,4 +104,10 @@ class Permissions {
   /// feature. Backed by the admin-only RLS policies on calendar_tags
   /// (migration 0023).
   static bool canManageTags(Map<String, dynamic>? m) => isAdmin(m);
+
+  /// Can create, edit, or delete stores (the per-household store list
+  /// that organizes shopping). Phase 1 Sub-branch 2b-2 of the shopping
+  /// rework. Backed by the admin-only RLS policies on stores from
+  /// migration 0026.
+  static bool canManageStores(Map<String, dynamic>? m) => isAdmin(m);
 }
