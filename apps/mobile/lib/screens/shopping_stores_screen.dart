@@ -121,12 +121,10 @@ class _ShoppingStoresScreenState extends State<ShoppingStoresScreen>
   }
 
   void _openStore(Map<String, dynamic> store) {
-    // Task 4 will refactor ShoppingListScreen to accept storeId. For now,
-    // push the existing screen — it loads the household's active list,
-    // which is what the user has today.
+    final storeId = store['id'] as String;
     Navigator.of(context).push<void>(
       MaterialPageRoute<void>(
-        builder: (_) => const ShoppingListScreen(),
+        builder: (_) => ShoppingListScreen(storeId: storeId),
       ),
     );
   }

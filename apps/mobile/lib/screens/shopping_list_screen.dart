@@ -25,7 +25,13 @@ const List<String> _shoppingCategories = [
 /// Full shopping list screen with multi-store support, manual entry,
 /// recipe ingredient import, purchased tracking, and category grouping.
 class ShoppingListScreen extends StatefulWidget {
-  const ShoppingListScreen({super.key});
+  const ShoppingListScreen({super.key, required this.storeId});
+
+  /// Required from Sub-branch 2b-2 Task 4 onward: scopes the screen to a
+  /// single store. ShoppingStoresScreen pushes with the tapped store's id;
+  /// the cross-store chip row at the top lets the user switch via
+  /// Navigator.pushReplacement.
+  final String storeId;
 
   @override
   State<ShoppingListScreen> createState() => _ShoppingListScreenState();
@@ -41,6 +47,11 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
   List<Map<String, dynamic>> _shoppingLists = [];
   List<Map<String, dynamic>> _shoppingItems = [];
   List<Map<String, dynamic>> _stores = [];
+  // Populated via get_stores_with_counts RPC; drives the cross-store chip
+  // row at the top of the screen. Distinct from _stores (which lacks counts)
+  // because we want live counts on chip labels without a second client-side
+  // aggregation pass.
+  List<Map<String, dynamic>> _storesWithCounts = [];
   List<Map<String, dynamic>> _householdRecipes = [];
   // Lowercased necessity-category names for this household — used by the
   // Batch 5a kid wishlist flow to decide which SnackBar copy to show after
@@ -132,11 +143,17 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
       _household = membership['households'];
       final householdId = _household!['id'];
 
-      final results = await Future.wait([
+      final results = await Future.wait<dynamic>([
+        // Active list for THIS store only (post-migration 0029 there's at
+        // most one is_active=true list per store; this fetch + first
+        // pattern preserves the existing call-shape without a maybeSingle
+        // refactor).
         Supabase.instance.client
             .from('shopping_lists')
             .select()
             .eq('household_id', householdId)
+            .eq('store_id', widget.storeId)
+            .eq('is_active', true)
             .order('created_at', ascending: false),
         Supabase.instance.client
             .from('stores')
@@ -152,14 +169,19 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
             .from('necessity_categories')
             .select('category')
             .eq('household_id', householdId),
+        Supabase.instance.client.rpc<List<dynamic>>(
+          'get_stores_with_counts',
+          params: {'p_household_id': householdId},
+        ),
       ]);
 
-      _shoppingLists = List<Map<String, dynamic>>.from(results[0]);
-      _stores = List<Map<String, dynamic>>.from(results[1]);
-      _householdRecipes = List<Map<String, dynamic>>.from(results[2]);
+      _shoppingLists = List<Map<String, dynamic>>.from(results[0] as List);
+      _stores = List<Map<String, dynamic>>.from(results[1] as List);
+      _householdRecipes = List<Map<String, dynamic>>.from(results[2] as List);
       _necessityCategoriesLower = (results[3] as List)
           .map((row) => (row['category'] as String).toLowerCase())
           .toList(growable: false);
+      _storesWithCounts = List<Map<String, dynamic>>.from(results[4] as List);
 
       if (_shoppingLists.isNotEmpty) {
         _activeListId = _shoppingLists.first['id'];
@@ -198,16 +220,9 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
   Future<void> _createDefaultList() async {
     if (_household == null) return;
 
-    // Default store is required — shopping_lists.store_id is NOT NULL after
-    // migration 0028. Backfill (0025) seeded a 'Grocery Store' with
-    // is_default=true for every household, so _stores should always have one.
-    // Defensive fallback to first store if none marked default.
-    final defaultStore = _stores.firstWhere(
-      (s) => s['is_default'] == true,
-      orElse: () => _stores.isNotEmpty ? _stores.first : <String, dynamic>{},
-    );
-    final storeId = defaultStore['id'] as String?;
-    if (storeId == null) return;
+    // store_id is widget.storeId — the screen is scoped to that store.
+    // shopping_lists.store_id is NOT NULL after migration 0028.
+    final storeId = widget.storeId;
 
     try {
       final newList = await Supabase.instance.client
@@ -277,12 +292,10 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
       context: context,
       isScrollControlled: true,
       builder: (context) => _AddShoppingItemSheet(
-        householdId: _household!['id'],
-        shoppingListId: _activeListId!,
+        storeId: widget.storeId,
         myMemberId: _myMembership!['id'],
         isKid: Permissions.isKid(_myMembership),
         necessityCategoriesLower: _necessityCategoriesLower,
-        stores: _stores,
       ),
     ).then((_) => _loadShoppingItems());
   }
@@ -292,8 +305,7 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
       context: context,
       isScrollControlled: true,
       builder: (context) => _AddFromRecipeSheet(
-        householdId: _household!['id'],
-        shoppingListId: _activeListId!,
+        storeId: widget.storeId,
         myMemberId: _myMembership!['id'],
         recipes: _householdRecipes,
       ),
@@ -448,39 +460,61 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
     );
   }
 
-  Future<void> _clearPurchasedItems() async {
+  /// Looks up the current store's display name from _stores. Falls back to
+  /// 'this store' during the brief window before _loadData completes.
+  String _currentStoreName() {
+    for (final s in _stores) {
+      if (s['id'] == widget.storeId) {
+        return s['name'] as String? ?? 'this store';
+      }
+    }
+    return 'this store';
+  }
+
+  Future<void> _doneShopping() async {
+    if (_activeListId == null) return;
+
+    final storeName = _currentStoreName();
+    final purchasedCount = _shoppingItems.where((i) => i['purchased'] == true).length;
+    final activeCount = _shoppingItems.where((i) => i['purchased'] != true).length;
+
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Clear purchased items?'),
-        content: const Text('This will remove all checked-off items from the list.'),
+      builder: (ctx) => AlertDialog(
+        title: Text('Done shopping at $storeName?'),
+        content: Text(
+          '$purchasedCount purchased ${purchasedCount == 1 ? 'item' : 'items'} and '
+          '$activeCount unchecked ${activeCount == 1 ? 'item' : 'items'} will be '
+          'archived. The store gets a fresh list.',
+        ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context, false),
+            onPressed: () => Navigator.pop(ctx, false),
             child: const Text('Cancel'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: FilledButton.styleFrom(backgroundColor: AppColors.coral),
-            child: const Text('Clear'),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Done shopping'),
           ),
         ],
       ),
     );
 
-    if (confirmed != true || _activeListId == null) return;
+    if (confirmed != true) return;
 
     try {
-      await Supabase.instance.client
-          .from('shopping_items')
-          .delete()
-          .eq('shopping_list_id', _activeListId!)
-          .eq('purchased', true);
-      _loadShoppingItems();
+      // archive_and_renew_list (migration 0030) archives the current list
+      // (sets archived_at=now() + is_active=false) and creates the next
+      // active list scoped to the same store, atomically.
+      await Supabase.instance.client.rpc<void>(
+        'archive_and_renew_list',
+        params: {'p_list_id': _activeListId},
+      );
+      if (mounted) await _loadData();
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not clear items.')),
+          const SnackBar(content: Text('Could not finish shopping.')),
         );
       }
     }
@@ -532,8 +566,8 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
                 case 'categories':
                   Navigator.push(context, MaterialPageRoute(builder: (_) => const ShoppingCategoryScreen()));
                   break;
-                case 'clear':
-                  _clearPurchasedItems();
+                case 'done':
+                  _doneShopping();
                   break;
               }
             },
@@ -546,13 +580,13 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
                   Text('Manage Categories'),
                 ]),
               ),
-              if (purchasedItems.isNotEmpty)
-                const PopupMenuItem(
-                  value: 'clear',
+              if (_activeListId != null)
+                PopupMenuItem(
+                  value: 'done',
                   child: Row(children: [
-                    Icon(Icons.cleaning_services_rounded, size: 20),
-                    SizedBox(width: 12),
-                    Text('Clear Purchased'),
+                    const Icon(Icons.check_circle_rounded, size: 20),
+                    const SizedBox(width: 12),
+                    Text('Done shopping at ${_currentStoreName()}'),
                   ]),
                 ),
             ],
@@ -571,6 +605,43 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
               child: ListView(
                 padding: const EdgeInsets.all(16),
                 children: [
+                  // Cross-store chip row. Always renders even when only one
+                  // store exists (visual consistency). Tapping an inactive
+                  // chip pushReplacement's into that store's detail view —
+                  // staying on the per-tab Navigator stack from home_shell.
+                  if (_storesWithCounts.isNotEmpty) ...[
+                    SizedBox(
+                      height: 40,
+                      child: ListView.separated(
+                        scrollDirection: Axis.horizontal,
+                        itemCount: _storesWithCounts.length,
+                        separatorBuilder: (_, __) => const SizedBox(width: 8),
+                        itemBuilder: (context, i) {
+                          final s = _storesWithCounts[i];
+                          final sid = s['id'] as String;
+                          final name = s['name'] as String? ?? 'Store';
+                          final count = (s['active_count'] as int?) ?? 0;
+                          final selected = sid == widget.storeId;
+                          return ChoiceChip(
+                            label: Text('$name ($count)',
+                                style: const TextStyle(fontSize: 13)),
+                            selected: selected,
+                            onSelected: (_) {
+                              if (selected) return;
+                              Navigator.of(context).pushReplacement(
+                                MaterialPageRoute<void>(
+                                  builder: (_) =>
+                                      ShoppingListScreen(storeId: sid),
+                                ),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+
                   // Quick actions. Batch 6a followup — "From recipe" hidden
                   // from kids; recipe-ingredient bulk-add only flows via the
                   // meal-request → admin approve → meal_plans path. Kids
@@ -834,25 +905,22 @@ class _ShoppingItemCard extends StatelessWidget {
 
 class _AddShoppingItemSheet extends StatefulWidget {
   const _AddShoppingItemSheet({
-    required this.householdId,
-    required this.shoppingListId,
+    required this.storeId,
     required this.myMemberId,
     required this.isKid,
     required this.necessityCategoriesLower,
-    required this.stores,
   });
 
-  final String householdId;
-  final String shoppingListId;
+  final String storeId;
   final String myMemberId;
-  // Batch 5a — when true, item insert routes through add_shopping_item RPC
-  // (server sets is_wishlist based on whether category is a necessity).
+  // Routes adds through the add_item_to_store RPC. When isKid=true the
+  // server may set is_wishlist=true if the category isn't a necessity;
+  // the kid SnackBar copy varies accordingly.
   final bool isKid;
   // Lowercased necessity-category names for the household; used purely to
   // pick the right SnackBar copy after a successful kid add. Server is the
   // source of truth for the actual is_wishlist decision.
   final List<String> necessityCategoriesLower;
-  final List<Map<String, dynamic>> stores;
 
   @override
   State<_AddShoppingItemSheet> createState() => _AddShoppingItemSheetState();
@@ -863,7 +931,6 @@ class _AddShoppingItemSheetState extends State<_AddShoppingItemSheet> {
   final _quantityController = TextEditingController();
   final _unitController = TextEditingController();
   String? _selectedCategory;
-  String? _selectedStoreId;
   bool _isLoading = false;
 
 
@@ -898,23 +965,25 @@ class _AddShoppingItemSheetState extends State<_AddShoppingItemSheet> {
       final displayQuantity = quantity.isEmpty ? null : (unit.isEmpty ? quantity : '$quantity $unit');
       final parsedQuantity = double.tryParse(quantity);
 
-      if (widget.isKid) {
-        // Kid path: route through add_shopping_item RPC. Server applies the
-        // kid+necessity-category logic and sets is_wishlist accordingly.
-        await Supabase.instance.client.rpc('add_shopping_item', params: {
-          'p_household_id': widget.householdId,
-          'p_member_id': widget.myMemberId,
-          'p_name': name,
-          'p_quantity': parsedQuantity,
-          'p_unit': unit.isEmpty ? null : unit,
-          'p_category': _selectedCategory,
-          'p_store_id': _selectedStoreId,
-          'p_shopping_list_id': widget.shoppingListId,
-          'p_display_quantity': displayQuantity,
-          // p_source_recipe_id / p_source_meal_plan_id: null (manual add).
-        });
+      // Unified path via add_item_to_store RPC (migration 0031). The RPC
+      // resolves household_id + active list_id from store_id, applies the
+      // kid+necessity wishlist routing internally, and inserts the row.
+      await Supabase.instance.client.rpc<void>('add_item_to_store', params: {
+        'p_member_id': widget.myMemberId,
+        'p_store_id': widget.storeId,
+        'p_name': name,
+        'p_quantity': parsedQuantity,
+        'p_unit': unit.isEmpty ? null : unit,
+        'p_category': _selectedCategory,
+        'p_display_quantity': displayQuantity,
+        // p_source_recipe_id / p_source_meal_plan_id: null (manual add).
+      });
 
-        if (mounted) {
+      if (mounted) {
+        if (widget.isKid) {
+          // Server is source-of-truth for is_wishlist; this mirror logic
+          // picks the matching SnackBar copy (necessity → on the list;
+          // otherwise → pending wishlist approval).
           final isNecessity = _selectedCategory != null &&
               widget.necessityCategoriesLower
                   .contains(_selectedCategory!.toLowerCase());
@@ -925,24 +994,8 @@ class _AddShoppingItemSheetState extends State<_AddShoppingItemSheet> {
                   : 'Added to wishlist — waiting for approval'),
             ),
           );
-          Navigator.pop(context);
         }
-      } else {
-        // Adult path: direct INSERT preserves all existing column writes.
-        await Supabase.instance.client.from('shopping_items').insert({
-          'household_id': widget.householdId,
-          'shopping_list_id': widget.shoppingListId,
-          'name': name,
-          'quantity': parsedQuantity,
-          'unit': unit.isEmpty ? null : unit,
-          'display_quantity': displayQuantity,
-          'store_id': _selectedStoreId,
-          'category': _selectedCategory,
-          'purchased': false,
-          'added_by_member_id': widget.myMemberId,
-        });
-
-        if (mounted) Navigator.pop(context);
+        Navigator.pop(context);
       }
     } catch (e) {
       debugPrint('add shopping item failed: $e');
@@ -1034,27 +1087,10 @@ class _AddShoppingItemSheetState extends State<_AddShoppingItemSheet> {
                 },
               ),
             ),
-            const SizedBox(height: 16),
-
-            // Store
-            DropdownButtonFormField<String>(
-              value: _selectedStoreId,
-              decoration: const InputDecoration(
-                labelText: 'Store (optional)',
-                prefixIcon: Icon(Icons.storefront_rounded),
-                border: OutlineInputBorder(),
-              ),
-              items: [
-                const DropdownMenuItem(value: null, child: Text('No specific store')),
-                ...widget.stores.map((s) => DropdownMenuItem(
-                  value: s['id'],
-                  child: Text(s['name'] ?? 'Unknown'),
-                )),
-              ],
-              onChanged: (v) => setState(() => _selectedStoreId = v),
-            ),
             const SizedBox(height: 24),
 
+            // Store picker removed — the parent ShoppingListScreen is
+            // scoped to widget.storeId, which the RPC consumes directly.
             FilledButton(
               onPressed: _isLoading ? null : _addItem,
               child: _isLoading
@@ -1070,14 +1106,12 @@ class _AddShoppingItemSheetState extends State<_AddShoppingItemSheet> {
 
 class _AddFromRecipeSheet extends StatefulWidget {
   const _AddFromRecipeSheet({
-    required this.householdId,
-    required this.shoppingListId,
+    required this.storeId,
     required this.myMemberId,
     required this.recipes,
   });
 
-  final String householdId;
-  final String shoppingListId;
+  final String storeId;
   final String myMemberId;
   // isKid removed as a Batch 6a followup — this sheet is now adult-only;
   // the entry-point button on shopping_list_screen is gated by
@@ -1200,23 +1234,21 @@ class _AddFromRecipeSheetState extends State<_AddFromRecipeSheet> {
     setState(() => _isLoading = true);
 
     try {
-      // Adult-only bulk insert. The kid branch (RPC path with
-      // source_recipe_id) was removed as a Batch 6a followup —
-      // recipe-ingredient bulk-add only flows via the meal-request →
-      // admin approve → meal_plans path. The UI entry point ("From
-      // recipe" button on shopping_list_screen) is gated to hide this
-      // sheet from kid sessions.
-      final inserts = _selectedIngredients.map((ing) => {
-        'household_id': widget.householdId,
-        'shopping_list_id': widget.shoppingListId,
-        'name': ing,
-        'display_quantity': null,
-        'purchased': false,
-        'source_recipe_id': _selectedRecipeId,
-        'added_by_member_id': widget.myMemberId,
-      }).toList();
-
-      await Supabase.instance.client.from('shopping_items').insert(inserts);
+      // Adult-only path (entry-point gated by Permissions.isKid on the
+      // parent screen). N RPC calls via add_item_to_store — one per
+      // ingredient. Known v1 limitation: ingredient strings aren't
+      // parsed, so quantity/unit/category land null. Improving that is
+      // a future task (likely Phase 4+ once we add a parser).
+      for (final ing in _selectedIngredients) {
+        await Supabase.instance.client.rpc<void>('add_item_to_store', params: {
+          'p_member_id': widget.myMemberId,
+          'p_store_id': widget.storeId,
+          'p_name': ing,
+          'p_source_recipe_id': _selectedRecipeId,
+          // p_quantity / p_unit / p_category / p_display_quantity /
+          // p_source_meal_plan_id all default to null.
+        });
+      }
 
       if (mounted) Navigator.pop(context);
     } catch (e) {
