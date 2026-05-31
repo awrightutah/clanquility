@@ -7,7 +7,7 @@ import '../utils/membership.dart';
 import '../utils/permissions.dart';
 import 'chore_dashboard_screen.dart';
 import 'meal_planner_screen.dart';
-import 'shopping_list_screen.dart';
+import 'shopping_stores_screen.dart';
 import 'calendar_screen.dart';
 import 'recipe_library_screen.dart';
 import 'members_screen.dart';
@@ -50,12 +50,25 @@ class _HomeShellScreenState extends State<HomeShellScreen> {
   // load + on chores/shopping realtime ticks + after Approvals screen pops.
   int _pendingTotal = 0;
 
-  final List<Widget> _screens = const [
-    ChoreDashboardScreen(),
-    MealPlannerScreen(),
-    ShoppingListScreen(),
-    CalendarScreen(),
-    RecipeLibraryScreen(),
+  // Per-tab Navigator for the Shopping tab so pushes (e.g., into a
+  // store-detail view) stay scoped to the tab's route stack across
+  // tab switches. The system back button on Android pops this
+  // Navigator before falling through to default exit behavior; see
+  // PopScope wrapper in build().
+  final GlobalKey<NavigatorState> _shoppingNavKey = GlobalKey<NavigatorState>();
+
+  List<Widget> get _screens => [
+    const ChoreDashboardScreen(),
+    const MealPlannerScreen(),
+    Navigator(
+      key: _shoppingNavKey,
+      onGenerateRoute: (settings) => MaterialPageRoute<void>(
+        builder: (_) => const ShoppingStoresScreen(),
+        settings: settings,
+      ),
+    ),
+    const CalendarScreen(),
+    const RecipeLibraryScreen(),
   ];
 
   @override
@@ -217,7 +230,24 @@ class _HomeShellScreenState extends State<HomeShellScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final scaffold = Scaffold(
+    final scaffold = PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        // On the Shopping tab, pop the per-tab Navigator if it has
+        // routes above its root. Lets system back unwind in-tab pushes
+        // (e.g., AddEditStoreScreen) before exiting/backgrounding the app.
+        if (_currentIndex == 2) {
+          final shoppingNav = _shoppingNavKey.currentState;
+          if (shoppingNav != null && shoppingNav.canPop()) {
+            shoppingNav.pop();
+            return;
+          }
+        }
+        // No tab-level pop available — fall through to system default
+        // (backgrounds the app on Android; ignored on iOS).
+      },
+      child: Scaffold(
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : Column(
@@ -393,6 +423,7 @@ class _HomeShellScreenState extends State<HomeShellScreen> {
                 ),
               ],
             ),
+      ),
     );
 
     if (_showTour) {
