@@ -149,7 +149,7 @@ Schema work:
 - Decision: "Unassigned" pseudo-store or required store-on-create? See Open Questions below.
 - Likely no new columns. Possibly a default_store_id on households.
 
-Open question: how do we backfill existing items? Probably: every household gets an "Unassigned" store seeded; existing null-store items get its id.
+Resolved (2026-05-31): backfill is trivial. No real store assignments exist anywhere. Plan: seed a single 'Grocery Store' marked is_default=true at household setup; one UPDATE shopping_items SET store_id = <household's default store id> WHERE store_id IS NULL AND household_id = <h>, applied per-household during the migration. New households get the seed via the household_setup_screen seed loop (matching the calendar_tags pattern at household_setup_screen.dart:104-119).
 
 ### Phase 2: Kid wishlist + admin store-on-approval
 
@@ -270,24 +270,15 @@ Tools:
 - **No live grocery pricing API.** Manual price entry + future receipt OCR are the path. Tier 3 scraping/API approaches are blocked by external reality (gated APIs, fragile scrapers).
 - **No store-layout aisle ordering for v1.** Data source doesn't exist; deferred indefinitely.
 - **Categories stay app-level fixed (the 12), but per-household customization exists via ShoppingCategoryScreen.** Not the same as calendar_tags. Different mental model: categories are about *what something is*, calendar tags are about *how the user wants to organize their schedule*.
+- **No "Unassigned" pseudo-store.** The original concept was a fallback for items without a store. Replaced by: every household gets a single seeded store at creation (marked is_default=true), so there's always somewhere for items to go. Cleaner mental model, no special-case bucket.
+- **is_default column repurposed.** The pre-existing is_default boolean on the stores table is used as 'this household's default store for new items.' New items default to is_default=true store. Admin can change which store is the household default. Default store cannot be deleted while it has items (forces admin to reassign or designate a new default first).
+- **Single seeded store at household creation.** New households get exactly one seeded store named 'Grocery Store' with is_default=true. User renames or replaces immediately as they discover their actual stores. Pattern diverges from calendar_tags seed (which seeded 4 example tags) because stores are too household-specific to anticipate — brand names like 'Costco' or 'Trader Joe's' might not be relevant to all households.
 
 ---
 
 ## Open questions
 
 These need decisions before relevant phases start.
-
-### "Unassigned" pseudo-store yes/no
-- **Option A:** Each household has an "Unassigned" pseudo-store seeded at creation. Items without an explicit store land there. Recipe fanout when no store is in context goes there. Renamed to "Anywhere" or "No store" or similar.
-- **Option B:** Store is required at item creation. Forms force the user to pick. No null-store items exist.
-
-Lean: A. Simpler for users, matches reality (sometimes you really don't know yet).
-
-### Backfill existing items with null store_id
-- Likely: seed "Unassigned" store per household; UPDATE shopping_items SET store_id = <unassigned_id> WHERE store_id IS NULL AND household_id = <h>.
-- Or: leave them null and treat null as "Unassigned" virtually in the UI.
-
-Decision needed before Phase 1.
 
 ### Quick-add items: shared household list or per-member?
 - Shared: one list of "milk/bread/eggs" for the whole household.
@@ -324,17 +315,27 @@ Lean: B if the user just dropped into the tab and wants to import a recipe befor
 
 ## Where stores currently get created
 
-Investigation flagged this as unknown: stores are read in shopping_list_screen.dart but no create/edit/delete UI exists there. Where do stores come from today?
+**Resolved 2026-05-31 via codebase-wide grep: nowhere.**
 
-To answer: grep the codebase for stores INSERT/UPDATE patterns. Likely seeded via migration, possibly via household setup screen, possibly nowhere yet (and the dropdown is just empty in practice).
+The schema (0001_initial_schema.sql), RLS policy, read path, store:stores(name) join on item-load, and DropdownButtonFormField render in _AddShoppingItemSheet are all pre-staged. But no code anywhere INSERTs into the stores table. Across apps/mobile/lib, services/api, and supabase/migrations, every reference to stores is read-only.
 
-This is the first thing to resolve at the start of Phase 1.
+Reality on the ground today:
+- Every household has zero stores.
+- The store-picker dropdown shows only the 'No specific store' sentinel option.
+- Every shopping_items row has store_id = null.
+- The store:stores(name) join returns null for every item.
+- The 🏪 icon + store name in _ShoppingItemCard.subtitle never renders for any user — it's dead UI.
+
+Implication for Phase 1: it's effectively greenfield for stores. No legacy data to migrate, no risk of stomping on existing assignments. The store-picker dropdown, the icon-and-name subtitle render path, and the store_id column are all wired and waiting — Phase 1 closes the loop by adding the write path + seed + management UI.
+
+The is_default column on the stores table is also pre-staged and unused. Phase 1 puts it to work (see Locked Decisions).
 
 ---
 
 ## Spec status
 
 - Created: 2026-05-31
-- Last updated: 2026-05-31
-- Status: Phase 0 (planning). No code work started yet on the rework.
+- Last updated: 2026-05-31 (after store-creation grep + Q1-Q4 decisions)
+- Status: Phase 0 (planning) → about to enter Phase 1 design.
+- Today's session resolved: where stores currently get created (nowhere), seed shape (single 'Grocery Store' with is_default=true), is_default semantics (user's default for new items), no Unassigned pseudo-store needed.
 - Document owner: Andrew + Claude across sessions; spec is the working narrative; updates happen inline as decisions land.
