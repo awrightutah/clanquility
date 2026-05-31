@@ -116,6 +116,16 @@ class _HouseholdSetupScreenState extends State<HouseholdSetupScreen> {
         });
       }
 
+      // Create a default store for the household. Failures propagate to
+      // the outer catch (same pattern as calendar_tags above), so a seed
+      // failure surfaces as 'Could not create household' to the user
+      // rather than leaving them with broken shopping state.
+      await Supabase.instance.client.from('stores').insert({
+        'household_id': householdId,
+        'name': 'Grocery Store',
+        'is_default': true,
+      });
+
       if (mounted) {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const HomeShellScreen()),
