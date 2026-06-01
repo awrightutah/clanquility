@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../theme/app_theme.dart';
 import '../utils/membership.dart';
+import '../utils/permissions.dart';
 
 /// Create or edit a single store. Pushed from ShoppingStoresScreen via
 /// the AppBar 'Add Store' action (create) or by tapping an edit affordance
@@ -27,6 +28,7 @@ class _AddEditStoreScreenState extends State<AddEditStoreScreen> {
   late final TextEditingController _nameController;
   bool _setAsDefault = false;
   bool _isSaving = false;
+  bool _isDeleting = false;
   bool _isLoading = true;
   String? _errorMessage;
 
@@ -185,6 +187,104 @@ class _AddEditStoreScreenState extends State<AddEditStoreScreen> {
     }
   }
 
+  Future<void> _deleteStore() async {
+    if (widget.existingStore == null) return;
+    final storeId = widget.existingStore!['id'] as String;
+    final storeName = widget.existingStore!['name'] as String? ?? 'this store';
+
+    // UI also hides the button for default stores, but defensive guard
+    // here matches the server-side P0003 raise from migration 0033.
+    if (_isCurrentDefault) {
+      setState(() => _errorMessage =
+          "Default store can't be deleted. Set another store as default first.");
+      return;
+    }
+
+    // On-demand item count for the confirmation message. Non-fatal —
+    // if the count query fails we still show the dialog without it.
+    int itemCount = 0;
+    try {
+      final response = await Supabase.instance.client
+          .from('shopping_items')
+          .select('id')
+          .eq('store_id', storeId)
+          .count(CountOption.exact);
+      itemCount = response.count;
+    } catch (_) {
+      // Fall through with itemCount = 0.
+    }
+
+    final defaultStore = _existingStores.firstWhere(
+      (s) => s['is_default'] == true,
+      orElse: () => <String, dynamic>{'name': 'the default store'},
+    );
+    final defaultName = defaultStore['name'] as String? ?? 'the default store';
+
+    final body = itemCount == 0
+        ? 'Delete $storeName?'
+        : 'Delete $storeName? Its $itemCount ${itemCount == 1 ? 'item' : 'items'} '
+            'will move to $defaultName.';
+
+    if (!mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete $storeName?'),
+        content: Text(body),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.coral),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+    if (!mounted) return;
+
+    setState(() {
+      _isDeleting = true;
+      _errorMessage = null;
+    });
+
+    try {
+      // delete_store_and_reassign (migration 0033): moves items off the
+      // store to the household default's active list, then deletes the
+      // store, all in one transaction.
+      await Supabase.instance.client.rpc<void>(
+        'delete_store_and_reassign',
+        params: {'p_store_id': storeId},
+      );
+      if (!mounted) return;
+      Navigator.of(context).pop(true);
+    } on PostgrestException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isDeleting = false;
+        if (e.code == 'P0003') {
+          _errorMessage =
+              "Default store can't be deleted. Set another store as default first.";
+        } else if (_isRlsError(e) || e.code == 'P0002') {
+          _errorMessage = 'Only household admins can delete stores.';
+        } else {
+          _errorMessage = 'Could not delete store: ${e.message}';
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isDeleting = false;
+        _errorMessage = 'Could not delete store: $e';
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -296,7 +396,7 @@ class _AddEditStoreScreenState extends State<AddEditStoreScreen> {
                       children: [
                         Expanded(
                           child: OutlinedButton(
-                            onPressed: _isSaving
+                            onPressed: (_isSaving || _isDeleting)
                                 ? null
                                 : () => Navigator.of(context).pop(false),
                             child: const Text('Cancel'),
@@ -305,7 +405,7 @@ class _AddEditStoreScreenState extends State<AddEditStoreScreen> {
                         const SizedBox(width: 12),
                         Expanded(
                           child: FilledButton(
-                            onPressed: _isSaving ? null : _save,
+                            onPressed: (_isSaving || _isDeleting) ? null : _save,
                             child: _isSaving
                                 ? const SizedBox(
                                     height: 18,
@@ -320,6 +420,83 @@ class _AddEditStoreScreenState extends State<AddEditStoreScreen> {
                         ),
                       ],
                     ),
+                    if (_isEditing &&
+                        Permissions.canManageStores(_myMembership)) ...[
+                      const SizedBox(height: 32),
+                      const Divider(),
+                      const SizedBox(height: 16),
+                      Text(
+                        'Danger zone',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                              color: Colors.grey.shade700,
+                              fontWeight: FontWeight.w700,
+                            ),
+                      ),
+                      const SizedBox(height: 12),
+                      if (_isCurrentDefault)
+                        Card(
+                          margin: EdgeInsets.zero,
+                          color: Colors.grey.shade100,
+                          elevation: 0,
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.info_outline_rounded,
+                                  color: Colors.grey.shade600,
+                                  size: 20,
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    "The default store can't be deleted. "
+                                    'Set another store as default to remove this one.',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodySmall
+                                        ?.copyWith(color: Colors.grey.shade700),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
+                      else
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            onPressed: (_isSaving || _isDeleting)
+                                ? null
+                                : _deleteStore,
+                            icon: _isDeleting
+                                ? const SizedBox(
+                                    height: 16,
+                                    width: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: AppColors.coral,
+                                    ),
+                                  )
+                                : const Icon(
+                                    Icons.delete_outline_rounded,
+                                    color: AppColors.coral,
+                                  ),
+                            label: Text(
+                              _isDeleting ? 'Deleting...' : 'Delete store',
+                              style: const TextStyle(
+                                color: AppColors.coral,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            style: OutlinedButton.styleFrom(
+                              side:
+                                  const BorderSide(color: AppColors.coral),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                          ),
+                        ),
+                    ],
                   ],
                 ),
               ),
