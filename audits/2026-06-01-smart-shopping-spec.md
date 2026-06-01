@@ -216,3 +216,72 @@ The biggest risk to this discipline is "good enough, just ship it" creep during 
 ---
 
 End of spec. Phase 2 implementation begins with Step 1 (store-routing memory) tomorrow or next session.
+
+---
+
+## Amendments after Step 1 investigation (2026-06-01 PM)
+
+After shipping Step 1, investigation into Step 2's actual scope (recipe ingredient schema, fanout paths, production data shape) surfaced findings that revise the original plan. These amendments are captured here rather than rewriting the spec above, so the original thinking is preserved alongside the corrections.
+
+### Step sequence revision: 6 steps → 7 steps
+
+The original Step 4 (attribution backfill) was discovered during investigation to have larger scope than the spec said. Specifically:
+- Paths 1, 4, 5 don't just lack attribution — they write `store_id = NULL`, dropping items into the store-scoped UI's invisible state
+- Path 2 still uses the pre-Phase-1 `add_shopping_item` RPC entirely, not just missing attribution
+
+This is a bigger fix than "route through `add_item_to_store`." It's also independent of the ingredient normalization work in Step 2. Splitting them keeps each step's risk profile distinct.
+
+**Revised sequence:**
+
+- **Step 1: Store-routing memory** ✓ shipped 2026-06-01
+- **Step 2: Ingredient normalization** (table + RPC + RLS + global seed + ingredient_id column + add_item_to_store amendment + tiny backfill)
+- **Step 3: Fanout path consolidation + store_id=NULL bug fix** (was originally Step 4, now expanded scope)
+- **Step 4: Meal consumption signal** (was Step 3)
+- **Step 5: Smaller prediction** (recipe-tonight ingredient check)
+- **Step 6: Bigger prediction** (consumption rate)
+
+Total step count: 6 → 7. Phase 2 timeline estimate adjusts from 8-12 sessions to 10-14 sessions.
+
+### Architecture decision: hybrid global + per-household for ingredients_master
+
+Original spec lock was "per-household ingredients_master." Re-evaluated during Step 2 design conversation. Real concerns:
+- Per-household means each household bootstraps from zero — autocomplete is useless until 10-20 recipes added
+- One-time backfill migration runs per-household, complicating the rollout
+
+Reverted to hybrid model:
+- `ingredients_master.household_id` is nullable
+- `household_id IS NULL` = global entries (seeded from public USDA dataset, ~300 common ingredients)
+- `household_id IS NOT NULL` = household-local additions
+- RLS pattern mirrors `chore_templates` (migration 0001, line 520): `household_id IS NULL OR is_household_member(household_id)`
+- Globals are migration-seeded only — RLS prevents client INSERT for global entries; per-household entries are member-writable
+
+**Why hybrid wins:** Fast cold-start (seeded list covers ~90% of common ingredients), no moderation work for v1 (households add locally; doesn't pollute global namespace), no typo pollution at global level, architecture supports future "promote local to global" admin tool with no schema changes.
+
+### Investigation corrections to "Current State" section
+
+**Recipe ingredient edit UI** captures only `{raw: text}` for manually-created entries (Path C in `recipe_library_screen.dart:587-622` and Path D in `recipe_library_screen.dart:874-908`). Both edit forms have a single TextField bound to `ing['raw']`.
+
+Production data shows all-structured shape because all 3 household_recipes came from master_library copies, not manual entry. The structured `{name, quantity, unit, category}` fields propagated from master.
+
+**Fanout path count is 5, not 4:**
+
+| Path | Location | Bug status |
+|------|----------|-----------|
+| 1. Meal scheduling auto-add (adult) | meal_planner_screen.dart:743-757 | Writes `store_id = NULL` |
+| 2. Meal scheduling auto-add (kid) | meal_planner_screen.dart:728-740 | Uses pre-Phase-1 `add_shopping_item` RPC |
+| 3. _AddFromRecipeSheet (Phase 1 path) | shopping_list_screen.dart:1221-1230 | ✓ Correct (uses add_item_to_store) |
+| 4. Recipe detail "add to cart" | recipe_detail_screen.dart:283-290 | Writes `store_id = NULL`, no source_recipe_id |
+| 5. Recipe library "add to shopping" | recipe_library_screen.dart:324-340 | Writes `store_id = NULL` |
+
+Step 3 (revised) routes all 5 through `add_item_to_store`.
+
+### `add_item_to_store` ingredient_id resolution
+
+`p_ingredient_id uuid DEFAULT NULL` parameter added to RPC signature.
+
+- When client provides `ingredient_id` (from autocomplete picker selection): RPC stores it as-is, validates it exists in `ingredients_master`
+- When `NULL`: RPC internally calls `normalize_ingredient_name(p_name)` and stores the resolved UUID
+- Server is source of truth for storage; client-provided value is a hint that avoids redundant normalize call
+
+### Followups
+Specific items not blocking Phase 2 work are tracked in `audits/followups.md` (created 2026-06-01 PM).
