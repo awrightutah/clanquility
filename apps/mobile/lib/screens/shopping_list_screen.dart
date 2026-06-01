@@ -5,22 +5,8 @@ import '../services/realtime_service.dart';
 import '../services/active_member_service.dart';
 import '../utils/membership.dart';
 import '../utils/permissions.dart';
+import '../utils/shopping_categories.dart';
 import 'shopping_category_screen.dart';
-
-const List<String> _shoppingCategories = [
-  'Produce',
-  'Dairy',
-  'Meat & Seafood',
-  'Pantry',
-  'Frozen',
-  'Bakery',
-  'Beverages',
-  'Snacks',
-  'Household',
-  'Personal Care',
-  'Pet Supplies',
-  'Other',
-];
 
 /// Full shopping list screen with multi-store support, manual entry,
 /// recipe ingredient import, purchased tracking, and category grouping.
@@ -413,7 +399,7 @@ class _ShoppingListScreenState extends State<ShoppingListScreen>
                 ),
                 items: [
                   const DropdownMenuItem<String>(value: null, child: Text('No category')),
-                  ..._shoppingCategories.map((c) => DropdownMenuItem<String>(value: c, child: Text(c))),
+                  ...shoppingCategories.map((c) => DropdownMenuItem<String>(value: c, child: Text(c))),
                 ],
                 onChanged: (v) => selectedCategory = v,
               ),
@@ -933,13 +919,6 @@ class _AddShoppingItemSheetState extends State<_AddShoppingItemSheet> {
   String? _selectedCategory;
   bool _isLoading = false;
 
-
-  static const _categoryEmojis = {
-    'Produce': '🥬', 'Dairy': '🥛', 'Meat & Seafood': '🥩', 'Pantry': '🫘',
-    'Frozen': '🧊', 'Bakery': '🍞', 'Beverages': '☕', 'Snacks': '🍪',
-    'Household': '🧹', 'Personal Care': '🧴', 'Pet Supplies': '🐾', 'Other': '📦',
-  };
-
   @override
   void dispose() {
     _nameController.dispose();
@@ -1074,13 +1053,13 @@ class _AddShoppingItemSheetState extends State<_AddShoppingItemSheet> {
               height: 42,
               child: ListView.separated(
                 scrollDirection: Axis.horizontal,
-                itemCount: _shoppingCategories.length,
+                itemCount: shoppingCategories.length,
                 separatorBuilder: (_, __) => const SizedBox(width: 6),
                 itemBuilder: (context, i) {
-                  final cat = _shoppingCategories[i];
+                  final cat = shoppingCategories[i];
                   final selected = _selectedCategory == cat;
                   return ChoiceChip(
-                    label: Text('${_categoryEmojis[cat]} ${cat}'),
+                    label: Text('${shoppingCategoryEmojis[cat]} ${cat}'),
                     selected: selected,
                     onSelected: (_) => setState(() => _selectedCategory = selected ? null : cat),
                   );
